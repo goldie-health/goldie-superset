@@ -44,6 +44,7 @@ import TextAreaControl from 'src/explore/components/controls/TextAreaControl';
 import SpatialControl from 'src/explore/components/controls/SpatialControl';
 import withToasts from 'src/components/MessageToasts/withToasts';
 import CurrencyControl from 'src/explore/components/controls/CurrencyControl';
+import { openSqlLab } from 'src/utils/sqllabUtils';
 import {
   Alert,
   AsyncSelect,
@@ -784,7 +785,15 @@ class DatasourceEditor extends PureComponent {
   }
 
   openOnSqlLab() {
-    window.open(this.getSQLLabUrl(), '_blank', 'noopener,noreferrer');
+    // Use POST for large SQL to avoid 414 errors
+    openSqlLab({
+      sql: this.state.datasource.sql,
+      dbid: this.state.datasource.database.id,
+      name: this.state.datasource.datasource_name,
+      schema: this.state.datasource.schema,
+      autorun: true,
+      openInNewTab: true,
+    });
   }
 
   tableChangeAndSyncMetadata() {

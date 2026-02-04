@@ -28,6 +28,11 @@ import copyTextToClipboard from 'src/utils/copy';
 import { RootState } from 'src/dashboard/types';
 import ViewQuery, { ViewQueryProps } from './ViewQuery';
 
+const mockOpenSqlLab = jest.fn();
+jest.mock('src/utils/sqllabUtils', () => ({
+  openSqlLab: (...args: any[]) => mockOpenSqlLab(...args),
+}));
+
 const mockHistoryPush = jest.fn();
 jest.mock('react-router-dom', () => ({
   ...jest.requireActual('react-router-dom'),
@@ -166,18 +171,17 @@ test('navigates to SQL Lab when View in SQL Lab button is clicked', () => {
 });
 
 test('opens SQL Lab in a new tab when View in SQL Lab button is clicked with meta key', () => {
-  window.open = jest.fn();
-
   setup(mockProps);
   const viewInSQLLabButton = screen.getByText('View in SQL Lab');
 
   fireEvent.click(viewInSQLLabButton, { metaKey: true });
 
   const { datasource, sql } = mockProps;
-  expect(window.open).toHaveBeenCalledWith(
-    `/sqllab?datasourceKey=${datasource}&sql=${encodeURIComponent(sql)}`,
-    '_blank',
-  );
+  expect(mockOpenSqlLab).toHaveBeenCalledWith({
+    sql,
+    datasourceKey: datasource,
+    openInNewTab: true,
+  });
 });
 
 test('hides View in SQL Lab button when user does not have SQL Lab access', () => {

@@ -44,6 +44,7 @@ import CodeSyntaxHighlighter, {
 } from '@superset-ui/core/components/CodeSyntaxHighlighter';
 import { useHistory } from 'react-router-dom';
 import { ExplorePageState } from 'src/explore/types';
+import { openSqlLab } from 'src/utils/sqllabUtils';
 
 export interface ViewQueryProps {
   sql: string;
@@ -135,10 +136,12 @@ const ViewQuery: FC<ViewQueryProps> = props => {
       };
       if (domEvent.metaKey || domEvent.ctrlKey) {
         domEvent.preventDefault();
-        window.open(
-          `/sqllab?datasourceKey=${datasource}&sql=${encodeURIComponent(currentSQL)}`,
-          '_blank',
-        );
+        // Use POST for large SQL to avoid 414 errors
+        openSqlLab({
+          sql: currentSQL,
+          datasourceKey: datasource,
+          openInNewTab: true,
+        });
       } else {
         history.push({ pathname: '/sqllab', state: { requestedQuery } });
       }
