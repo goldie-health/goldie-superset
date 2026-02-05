@@ -41,6 +41,8 @@ services:
     env_file:
       - path: docker/.env # default
         required: true
+      - path: docker/.env-goldie
+        required: false
       - path: docker/.env-local # optional override
         required: false
     image: postgres:18
@@ -54,6 +56,8 @@ services:
     env_file:
       - path: docker/.env # default
         required: true
+      - path: docker/.env-goldie
+        required: false
       - path: docker/.env-local # optional override
         required: false
     image: *superset-image
@@ -75,6 +79,8 @@ services:
     env_file:
       - path: docker/.env # default
         required: true
+      - path: docker/.env-goldie
+        required: false
       - path: docker/.env-local # optional override
         required: false
     depends_on:
@@ -94,6 +100,8 @@ services:
     env_file:
       - path: docker/.env # default
         required: true
+      - path: docker/.env-goldie
+        required: false
       - path: docker/.env-local # optional override
         required: false
     restart: unless-stopped
@@ -115,6 +123,8 @@ services:
     env_file:
       - path: docker/.env # default
         required: true
+      - path: docker/.env-goldie
+        required: false
       - path: docker/.env-local # optional override
         required: false
     restart: unless-stopped
