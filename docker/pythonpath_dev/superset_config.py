@@ -68,27 +68,69 @@ SQLALCHEMY_DATABASE_URI = (
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
 # REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-REDIS_CELERY_DB = os.getenv("REDIS_CELERY_DB", "0")
-REDIS_RESULTS_DB = os.getenv("REDIS_RESULTS_DB", "1")
-REDIS_RATELIMIT_DB = os.getenv("REDIS_RATELIMIT_DB", "2")
+
+# Dedicated Redis logical DBs per concern so they never collide on keyspace.
+# (Previously the SQL Lab results backend shared db 0 with the Celery broker,
+# and the data cache shared db 1 with the Celery result backend.)
+REDIS_CELERY_DB = os.getenv("REDIS_CELERY_DB", "0")          # Celery broker
+REDIS_RESULTS_DB = os.getenv("REDIS_RESULTS_DB", "1")        # Celery result backend
+REDIS_RATELIMIT_DB = os.getenv("REDIS_RATELIMIT_DB", "2")    # Flask-Limiter
+REDIS_DATA_CACHE_DB = os.getenv("REDIS_DATA_CACHE_DB", "3")  # chart/data + thumbnail cache
+REDIS_SQLLAB_DB = os.getenv("REDIS_SQLLAB_DB", "4")          # SQL Lab results backend
+REDIS_STATE_CACHE_DB = os.getenv("REDIS_STATE_CACHE_DB", "5")  # filter/explore state
+REDIS_ASYNC_DB = os.getenv("REDIS_ASYNC_DB", "6")           # global async query events
+
+# Default cache TTLs (seconds). Data cache is long because analytics data
+# refreshes infrequently; pair it with scheduled cache warmup for best effect.
+APP_CACHE_TIMEOUT = int(os.getenv("APP_CACHE_TIMEOUT", "300"))
+DATA_CACHE_TIMEOUT = int(os.getenv("DATA_CACHE_TIMEOUT", "86400"))
 
 # RESULTS_BACKEND = FileSystemCache("/app/superset_home/sqllab")
 RESULTS_BACKEND = RedisCache(
     host=REDIS_HOST,
     port=int(REDIS_PORT),
+    db=int(REDIS_SQLLAB_DB),
     key_prefix="superset_results",
 )
 
+# Generic Flask app cache (metadata, misc). Short TTL is fine here.
 CACHE_CONFIG = {
     "CACHE_TYPE": "RedisCache",
-    "CACHE_DEFAULT_TIMEOUT": 300,
+    "CACHE_DEFAULT_TIMEOUT": APP_CACHE_TIMEOUT,
     "CACHE_KEY_PREFIX": "superset_",
     "CACHE_REDIS_HOST": REDIS_HOST,
     "CACHE_REDIS_PORT": REDIS_PORT,
-    "CACHE_REDIS_DB": REDIS_RESULTS_DB,
+    "CACHE_REDIS_DB": REDIS_DATA_CACHE_DB,
 }
-DATA_CACHE_CONFIG = CACHE_CONFIG
-THUMBNAIL_CACHE_CONFIG = CACHE_CONFIG
+
+# Chart/query result cache — the one that actually offloads the analytics DB.
+DATA_CACHE_CONFIG = {
+    **CACHE_CONFIG,
+    "CACHE_DEFAULT_TIMEOUT": DATA_CACHE_TIMEOUT,
+    "CACHE_KEY_PREFIX": "superset_data_",
+}
+THUMBNAIL_CACHE_CONFIG = {
+    **CACHE_CONFIG,
+    "CACHE_DEFAULT_TIMEOUT": DATA_CACHE_TIMEOUT,
+    "CACHE_KEY_PREFIX": "superset_thumb_",
+}
+
+# Filter and explore form state — default backend is the metadata DB
+# (SupersetMetastoreCache), which adds load to the metadata pool. Move it to
+# Redis to keep that pool free. Trade-off: state is lost if Redis is flushed.
+FILTER_STATE_CACHE_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_DEFAULT_TIMEOUT": int(os.getenv("FILTER_STATE_CACHE_TIMEOUT", "604800")),
+    "CACHE_KEY_PREFIX": "superset_filter_",
+    "CACHE_REDIS_HOST": REDIS_HOST,
+    "CACHE_REDIS_PORT": REDIS_PORT,
+    "CACHE_REDIS_DB": REDIS_STATE_CACHE_DB,
+    "REFRESH_TIMEOUT_ON_RETRIEVAL": True,
+}
+EXPLORE_FORM_DATA_CACHE_CONFIG = {
+    **FILTER_STATE_CACHE_CONFIG,
+    "CACHE_KEY_PREFIX": "superset_explore_",
+}
 
 # Flask-Limiter storage backend (Redis)
 # This prevents the warning about in-memory storage and enables proper rate limiting
@@ -132,6 +174,34 @@ FEATURE_FLAGS = {
 
     # Jinja templating in queries for SQL Lab and Explore
     'ENABLE_TEMPLATE_PROCESSING': True,
+
+    # Run chart/dashboard queries asynchronously on Celery workers instead of
+    # tying up a web worker thread + DB connection for the whole query. This is
+    # the key fix for dashboards with many charts exhausting the connection pool.
+    'GLOBAL_ASYNC_QUERIES': os.getenv(
+        "GLOBAL_ASYNC_QUERIES", "true"
+    ).lower() == "true",
+}
+
+# ============================================================================
+# Global Async Queries
+# ============================================================================
+# Uses the "polling" transport so no extra superset-websocket service is
+# required — the browser polls the Superset API, results are streamed via Redis,
+# and the actual queries run on the existing Celery workers.
+GLOBAL_ASYNC_QUERIES_TRANSPORT = "polling"
+# Secret used to sign the async JWT cookie. MUST not be the upstream default;
+# fall back to the app SECRET_KEY if a dedicated one isn't provided.
+GLOBAL_ASYNC_QUERIES_JWT_SECRET = os.getenv(
+    "GLOBAL_ASYNC_QUERIES_JWT_SECRET", SECRET_KEY
+)
+GLOBAL_ASYNC_QUERIES_JWT_COOKIE_SECURE = SESSION_COOKIE_SECURE
+GLOBAL_ASYNC_QUERIES_CACHE_BACKEND = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_REDIS_HOST": REDIS_HOST,
+    "CACHE_REDIS_PORT": int(REDIS_PORT),
+    "CACHE_REDIS_DB": int(REDIS_ASYNC_DB),
+    "CACHE_DEFAULT_TIMEOUT": 300,
 }
 
 ALERT_REPORTS_NOTIFICATION_DRY_RUN = False
@@ -152,18 +222,31 @@ log_level_text = os.getenv("SUPERSET_LOG_LEVEL", "INFO")
 LOG_LEVEL = getattr(logging, log_level_text.upper(), logging.INFO)
 
 # ============================================================================
-# SQL Debugging Configuration
+# Metadata database connection pool + SQL Debugging Configuration
 # ============================================================================
 
-# Enable SQL query logging to console
-# This will log all SQL queries executed by SQLAlchemy (metadata database)
+# SQL echo logs EVERY statement run against the metadata DB. It is a heavy
+# perf hit and must stay OFF in production. Enable only for local debugging
+# via SQLALCHEMY_ECHO=true.
+SQLALCHEMY_ECHO = os.getenv("SQLALCHEMY_ECHO", "false").lower() == "true"
+
+# Connection pool tuning for the metadata database (the RDS Postgres that
+# backs Superset itself). Defaults below are sized for the gunicorn worker x
+# thread count in docker/entrypoints/run-server.sh. Keep
+# (workers * threads) <= (pool_size + max_overflow) <= RDS max_connections.
 SQLALCHEMY_ENGINE_OPTIONS = {
-    "echo": True,  # Log all SQL statements
+    "echo": SQLALCHEMY_ECHO,
+    "pool_size": int(os.getenv("SQLALCHEMY_POOL_SIZE", "20")),
+    "max_overflow": int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "40")),
+    "pool_timeout": int(os.getenv("SQLALCHEMY_POOL_TIMEOUT", "60")),
+    "pool_recycle": int(os.getenv("SQLALCHEMY_POOL_RECYCLE", "1800")),
+    "pool_pre_ping": True,
 }
 
-# Enable logging for SQLAlchemy engine to see SQL queries in console
-# Set to logging.INFO to see SQL queries, or logging.DEBUG for more details
-logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
+# Engine/pool logging. Only emit per-query INFO logs when debugging.
+logging.getLogger("sqlalchemy.engine").setLevel(
+    logging.INFO if SQLALCHEMY_ECHO else logging.WARNING
+)
 logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
 
 # Custom QUERY_LOGGER to log all SQL queries to external databases
@@ -198,7 +281,10 @@ def log_sql_query(
         f"{'=' * 80}"
     )
 
-QUERY_LOGGER = log_sql_query
+# Logs every external (chart / SQL Lab) query to the console. Useful for
+# debugging, but pure overhead in production — gate it behind the same flag.
+if SQLALCHEMY_ECHO:
+    QUERY_LOGGER = log_sql_query
 
 # ============================================================================
 # Talisman Security Configuration
