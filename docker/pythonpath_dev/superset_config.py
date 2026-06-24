@@ -77,13 +77,11 @@ REDIS_RESULTS_DB = os.getenv("REDIS_RESULTS_DB", "1")        # Celery result bac
 REDIS_RATELIMIT_DB = os.getenv("REDIS_RATELIMIT_DB", "2")    # Flask-Limiter
 REDIS_DATA_CACHE_DB = os.getenv("REDIS_DATA_CACHE_DB", "3")  # chart/data + thumbnail cache
 REDIS_SQLLAB_DB = os.getenv("REDIS_SQLLAB_DB", "4")          # SQL Lab results backend
-REDIS_STATE_CACHE_DB = os.getenv("REDIS_STATE_CACHE_DB", "5")  # filter/explore state
-REDIS_ASYNC_DB = os.getenv("REDIS_ASYNC_DB", "6")           # global async query events
 
-# Default cache TTLs (seconds). Data cache is long because analytics data
-# refreshes infrequently; pair it with scheduled cache warmup for best effect.
+# Default cache TTLs (seconds). Data cache is 1h: long enough to offload the
+# shared RDS, short enough that dashboards don't show stale numbers for long.
 APP_CACHE_TIMEOUT = int(os.getenv("APP_CACHE_TIMEOUT", "300"))
-DATA_CACHE_TIMEOUT = int(os.getenv("DATA_CACHE_TIMEOUT", "86400"))
+DATA_CACHE_TIMEOUT = int(os.getenv("DATA_CACHE_TIMEOUT", "3600"))
 
 # RESULTS_BACKEND = FileSystemCache("/app/superset_home/sqllab")
 RESULTS_BACKEND = RedisCache(
@@ -115,22 +113,11 @@ THUMBNAIL_CACHE_CONFIG = {
     "CACHE_KEY_PREFIX": "superset_thumb_",
 }
 
-# Filter and explore form state — default backend is the metadata DB
-# (SupersetMetastoreCache), which adds load to the metadata pool. Move it to
-# Redis to keep that pool free. Trade-off: state is lost if Redis is flushed.
-FILTER_STATE_CACHE_CONFIG = {
-    "CACHE_TYPE": "RedisCache",
-    "CACHE_DEFAULT_TIMEOUT": int(os.getenv("FILTER_STATE_CACHE_TIMEOUT", "604800")),
-    "CACHE_KEY_PREFIX": "superset_filter_",
-    "CACHE_REDIS_HOST": REDIS_HOST,
-    "CACHE_REDIS_PORT": REDIS_PORT,
-    "CACHE_REDIS_DB": REDIS_STATE_CACHE_DB,
-    "REFRESH_TIMEOUT_ON_RETRIEVAL": True,
-}
-EXPLORE_FORM_DATA_CACHE_CONFIG = {
-    **FILTER_STATE_CACHE_CONFIG,
-    "CACHE_KEY_PREFIX": "superset_explore_",
-}
+# Filter and explore form state intentionally keep Superset's default backend
+# (SupersetMetastoreCache, stored in the metadata DB). It is durable and already
+# holds users' existing shared/bookmarked filter & explore links — moving it to
+# Redis would invalidate those and lose state on a Redis flush. The metadata-pool
+# load it adds is negligible.
 
 # Flask-Limiter storage backend (Redis)
 # This prevents the warning about in-memory storage and enables proper rate limiting
@@ -175,33 +162,10 @@ FEATURE_FLAGS = {
     # Jinja templating in queries for SQL Lab and Explore
     'ENABLE_TEMPLATE_PROCESSING': True,
 
-    # Run chart/dashboard queries asynchronously on Celery workers instead of
-    # tying up a web worker thread + DB connection for the whole query. This is
-    # the key fix for dashboards with many charts exhausting the connection pool.
-    'GLOBAL_ASYNC_QUERIES': os.getenv(
-        "GLOBAL_ASYNC_QUERIES", "true"
-    ).lower() == "true",
-}
-
-# ============================================================================
-# Global Async Queries
-# ============================================================================
-# Uses the "polling" transport so no extra superset-websocket service is
-# required — the browser polls the Superset API, results are streamed via Redis,
-# and the actual queries run on the existing Celery workers.
-GLOBAL_ASYNC_QUERIES_TRANSPORT = "polling"
-# Secret used to sign the async JWT cookie. MUST not be the upstream default;
-# fall back to the app SECRET_KEY if a dedicated one isn't provided.
-GLOBAL_ASYNC_QUERIES_JWT_SECRET = os.getenv(
-    "GLOBAL_ASYNC_QUERIES_JWT_SECRET", SECRET_KEY
-)
-GLOBAL_ASYNC_QUERIES_JWT_COOKIE_SECURE = SESSION_COOKIE_SECURE
-GLOBAL_ASYNC_QUERIES_CACHE_BACKEND = {
-    "CACHE_TYPE": "RedisCache",
-    "CACHE_REDIS_HOST": REDIS_HOST,
-    "CACHE_REDIS_PORT": int(REDIS_PORT),
-    "CACHE_REDIS_DB": int(REDIS_ASYNC_DB),
-    "CACHE_DEFAULT_TIMEOUT": 300,
+    # NOTE: GLOBAL_ASYNC_QUERIES is intentionally left OFF. On the shared
+    # t4g.micro it adds no DB capacity, and in the embedded iframe its async JWT
+    # cookie needs SameSite="None" to be sent cross-site. Roll it out as a
+    # separate, staged change. See openspec/minimal-safe-deploy.md.
 }
 
 ALERT_REPORTS_NOTIFICATION_DRY_RUN = False
@@ -231,14 +195,15 @@ LOG_LEVEL = getattr(logging, log_level_text.upper(), logging.INFO)
 SQLALCHEMY_ECHO = os.getenv("SQLALCHEMY_ECHO", "false").lower() == "true"
 
 # Connection pool tuning for the metadata database (the RDS Postgres that
-# backs Superset itself). Defaults below are sized for the gunicorn worker x
-# thread count in docker/entrypoints/run-server.sh. Keep
+# backs Superset itself). Real values come from docker/.env-goldie; the defaults
+# below are deliberately small so a missing env file can't blow past a tiny
+# instance's max_connections. Keep
 # (workers * threads) <= (pool_size + max_overflow) <= RDS max_connections.
 SQLALCHEMY_ENGINE_OPTIONS = {
     "echo": SQLALCHEMY_ECHO,
-    "pool_size": int(os.getenv("SQLALCHEMY_POOL_SIZE", "20")),
-    "max_overflow": int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "40")),
-    "pool_timeout": int(os.getenv("SQLALCHEMY_POOL_TIMEOUT", "60")),
+    "pool_size": int(os.getenv("SQLALCHEMY_POOL_SIZE", "5")),
+    "max_overflow": int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "3")),
+    "pool_timeout": int(os.getenv("SQLALCHEMY_POOL_TIMEOUT", "30")),
     "pool_recycle": int(os.getenv("SQLALCHEMY_POOL_RECYCLE", "1800")),
     "pool_pre_ping": True,
 }
